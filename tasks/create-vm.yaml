@@ -1,0 +1,45 @@
+---
+- name: "[Create] Set Defaults"
+  set_fact:
+    workflow_filename: "terraform.yml"
+    branch: "v1.0.4"
+  tags: ["create-vm"]
+
+- name: "[Create] Trigger GitHub Workflow"
+  include_tasks: tasks/trigger-request.yaml
+  tags: ["create-vm"]
+
+- name: "[Create] Get Workflow Runs"
+  uri:
+    url: "https://api.github.com/repos/{{ github_owner }}/{{ github_repo }}/actions/runs?workflow_id={{ workflow_filename }}&branch={{ branch }}&event=workflow_dispatch"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ github_token }}"
+      Accept: "application/vnd.github+json"
+      X-GitHub-Api-Version: "{{ api_version }}"
+  register: runs_result
+  tags: ["create-vm"]
+
+- name: "[Create] Set Run ID"
+  set_fact:
+    run_id: "{{ runs_result.json.workflow_runs[0].id }}"
+  when: runs_result.json.workflow_runs | length > 0
+  tags: ["create-vm"]
+
+- name: "[Create] Poll Workflow Status"
+  include_tasks: tasks/check-wf-status.yaml
+  loop: "{{ range(0, max_attempts) | list }}"
+  when: run_id is defined
+  tags: ["create-vm"]
+
+- name: "[Create] Final Workflow Status"
+  debug:
+    msg: "Final Workflow Status: {{ workflow_status }}, Conclusion: {{ workflow_conclusion }}"
+  when: runs_result.json.workflow_runs | length > 0
+  tags: ["create-vm"]
+
+- name: "[Create] Handle no runs found"
+  debug:
+    msg: "No workflow runs found."
+  when: runs_result.json.workflow_runs | length == 0
+  tags: ["create-vm"]

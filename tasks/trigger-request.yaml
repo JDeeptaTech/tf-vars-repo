@@ -1,0 +1,21 @@
+---
+    - name: Trigger GitHub Workflow
+      uri:
+        url: "https://api.github.com/repos/{{ github_owner }}/{{ github_repo }}/actions/workflows/{{ workflow_filename }}/dispatches"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ github_token }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "{{ api_version }}"
+        body_format: json
+        body:
+          ref: "{{ branch }}"
+          inputs:
+            requestor: "{{ requestor }}"
+            datacenter: "{{ datacenter }}"
+        status_code: 204 # 204 No Content indicates success
+      register: trigger_result
+    - name: Check Trigger Result
+      debug:
+        msg: "Workflow Triggered Successfully"
+      when: trigger_result.status == 204

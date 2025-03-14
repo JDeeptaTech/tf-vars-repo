@@ -1,0 +1,48 @@
+---
+- name: Trigger and Check GitHub Workflow Status
+  hosts: localhost
+  gather_facts: false
+  vars:
+    github_owner: "JDeeptaTech"
+    github_repo: "terraform-code-repo"
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+    workflow_filename: "terraform.yml"
+    api_version: "2022-11-28"
+    poll_interval: 10 # Seconds to wait between status checks
+    max_attempts: 5 # Maximum number of status checks
+    branch: "v1.0.4"
+    requestor: "pt01"
+    datacenter: "dc-02"
+  tasks:
+    - name: Trigger GitHub Workflow
+      include_tasks: tasks/trigger-request.yaml
+
+    - name: Get Workflow Runs
+      uri:
+        url: "https://api.github.com/repos/{{ github_owner }}/{{ github_repo }}/actions/runs?workflow_id={{ workflow_filename }}&branch={{ branch }}&event=workflow_dispatch"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ github_token }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "{{ api_version }}"
+      register: runs_result
+
+    - name: Set Run ID
+      set_fact:
+        run_id: "{{ runs_result.json.workflow_runs[0].id }}"
+      when: runs_result.json.workflow_runs | length > 0
+
+    - name: Poll Workflow Status
+      include_tasks: tasks/check-wf-status.yaml
+      loop: "{{ range(0, max_attempts) | list }}"
+      when: run_id is defined
+
+    - name: Final Workflow Status
+      debug:
+        msg: "Final Workflow Status: {{ workflow_status }}, Conclusion: {{ workflow_conclusion }}"
+      when: runs_result.json.workflow_runs | length > 0
+
+    - name: Handle no runs found
+      debug:
+        msg: "No workflow runs found."
+      when: runs_result.json.workflow_runs | length == 0

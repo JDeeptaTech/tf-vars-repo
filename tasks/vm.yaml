@@ -1,0 +1,19 @@
+---
+- name: "[ VM ] Set Defaults"
+  set_fact:
+    workflow_filename: "vm-terraform.yml"
+    branch: "v1.0.6"
+    template_name: "vm-request.j2"
+
+- name: "[ VM ] Trigger GitHub Workflow"
+  include_tasks: tasks/trigger-request.yaml
+
+- name: "[ VM ] Get GitHub Workflow Run ID"
+  include_tasks: tasks/get-wf-run.yaml
+
+- name: "[ VM ] Poll Workflow Status"
+  include_tasks: tasks/check-wf-status.yaml
+  loop: "{{ range(0, max_attempts) | list }}"
+  when: run_id is defined
+
+

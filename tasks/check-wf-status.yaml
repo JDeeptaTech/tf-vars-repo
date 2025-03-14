@@ -1,5 +1,5 @@
 ---
-- name: Get Workflow Run Status
+- name: "[ CHECK RUN ] Get Workflow Run Status"
   uri:
     url: "https://api.github.com/repos/{{ github_owner }}/{{ github_repo }}/actions/runs/{{ run_id }}"
     method: GET
@@ -8,21 +8,17 @@
       Accept: "application/vnd.github+json"
       X-GitHub-Api-Version: "{{ api_version }}"
   register: run_status_result
-  tags:  ["create-vm", "update-vm"]
 
-- name: Check Workflow Status
+- name: "[ CHECK RUN ] Check Workflow Status"
   set_fact:
     workflow_status: "{{ run_status_result.json.status }}"
     workflow_conclusion: "{{ run_status_result.json.conclusion }}"
-  tags: ["create-vm", "update-vm"]
 
-- name: Display Status
+- name: "[ CHECK RUN ] Display Status"
   debug:
     msg: "Workflow Status: {{ workflow_status }}, Conclusion: {{ workflow_conclusion }}"
-  tags:  ["create-vm", "update-vm"]
 
-- name: Pause for Polling
+- name: "[ CHECK RUN ] Pause for Polling"
   pause:
     seconds: "{{ poll_interval }}"
   when: workflow_status != "completed" and workflow_status != "queued" and workflow_status != "in_progress"
-  tags:  ["create-vm", "update-vm"]

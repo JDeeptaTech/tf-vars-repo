@@ -1,4 +1,0 @@
----
-- name: Dsiplay Run info
-  debug:
-    msg: "No resource type specified and no to perform"

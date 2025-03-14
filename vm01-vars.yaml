@@ -1,0 +1,4 @@
+requestor: "pt01"
+datacenter: "dc-01"
+vm_count: 1
+action: "vm"

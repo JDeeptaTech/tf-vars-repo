@@ -1,3 +1,39 @@
+```sql
+CREATE TABLE vm_registry (
+    -- ── Identity ─────────────────────────────────────────────────
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    vm_queue_id      UUID REFERENCES vm_queue(id),
+    vm_name          TEXT NOT NULL,
+    environment      TEXT NOT NULL,
+    owner_team       TEXT NOT NULL,
+    requested_by     TEXT NOT NULL,
+
+    -- ── Location (relational — Day-2 resolver) ───────────────────
+    cluster_name     TEXT NOT NULL,
+    cluster_api_url  TEXT NOT NULL,
+    namespace        TEXT NOT NULL,
+    node_name        TEXT,
+    instancetype     TEXT NOT NULL,
+
+    -- ── Lifecycle ────────────────────────────────────────────────
+    status           TEXT NOT NULL DEFAULT 'building',
+    power_state      TEXT NOT NULL DEFAULT 'unknown',
+
+    -- ── JSONB — only what belongs here ───────────────────────────
+    network          JSONB NOT NULL DEFAULT '{}',
+    storage          JSONB NOT NULL DEFAULT '[]',
+    placement        JSONB NOT NULL DEFAULT '{}',
+    tags             JSONB NOT NULL DEFAULT '{}',
+
+    -- ── Timestamps ───────────────────────────────────────────────
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at     TIMESTAMPTZ,
+
+    UNIQUE (vm_name, cluster_name, namespace)
+);
+```
+
 # VM Self-Service Platform — Database Migrations
 
 Alembic-based PostgreSQL migration system for the VM Self-Service Platform.  

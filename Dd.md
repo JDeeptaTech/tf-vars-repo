@@ -1,4 +1,41 @@
 ```sql
+
+-- Your vm_queue table
+CREATE TABLE vm_queue (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    vm_name     TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    status      TEXT DEFAULT 'pending',   -- pending/placed/failed
+    spec        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT now(),
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- Trigger function — fires NOTIFY automatically on insert/update
+CREATE OR REPLACE FUNCTION notify_vm_queue_change()
+RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify(
+        'vm_queue_events',              -- channel name
+        json_build_object(
+            'id',          NEW.id,
+            'vm_name',     NEW.vm_name,
+            'environment', NEW.environment,
+            'status',      NEW.status,
+            'operation',   TG_OP          -- INSERT / UPDATE / DELETE
+        )::text
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger to table
+CREATE TRIGGER vm_queue_notify
+    AFTER INSERT OR UPDATE ON vm_queue
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_vm_queue_change();
+
+
 CREATE TABLE vm_registry (
     -- ── Identity ─────────────────────────────────────────────────
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -1,5 +1,25 @@
 ```sql
 
+-- Create the migration role
+CREATE ROLE migration_role LOGIN PASSWORD 'use-vault-not-this';
+
+-- Own the schemas so it can create objects inside them
+GRANT CREATE ON DATABASE platform_db TO migration_role;
+
+-- Schema-level permissions
+GRANT ALL ON SCHEMA platform   TO migration_role;
+GRANT ALL ON SCHEMA config     TO migration_role;
+GRANT ALL ON SCHEMA audit      TO migration_role;
+GRANT ALL ON SCHEMA _internal  TO migration_role;
+
+-- Superuser-adjacent privileges needed for migrations only
+-- (creating triggers, functions with SECURITY DEFINER)
+GRANT pg_signal_backend TO migration_role;  -- optional: kill stuck connections
+
+-- Needed to create SECURITY DEFINER functions (like record_audit_event)
+ALTER ROLE migration_role CREATEROLE;       -- only if creating roles in migrations
+
+
 -- Your vm_queue table
 CREATE TABLE vm_queue (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),

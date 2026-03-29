@@ -1,0 +1,716 @@
+"""
+AAP (Ansible Automation Platform) — Playbook Schedule Manager
+==============================================================
+Authentication : Username + Password (Basic Auth)
+Schedule types : One-time  |  Recurring (rrule / cron-like)
+Operations     : Create  |  List  |  Delete  |  Enable / Disable
+
+Required environment variables
+--------------------------------
+  AAP_URL       https://aap.your-company.com
+  AAP_USERNAME  admin
+  AAP_PASSWORD  s3cr3t
+
+Optional
+--------
+  AAP_VERIFY_SSL   true | false  (default: true)
+  AAP_TIMEOUT      seconds       (default: 30)
+
+Quick start
+-----------
+  pip install requests
+  export AAP_URL=https://aap.example.com
+  export AAP_USERNAME=admin
+  export AAP_PASSWORD=secret
+  export JT_NAME="My Playbook Template"
+  python aap_schedule_manager.py
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("aap_schedule")
+
+
+# ---------------------------------------------------------------------------
+# iCalendar RRULE helpers
+# ---------------------------------------------------------------------------
+# AAP requires schedules in iCalendar RRULE format — NOT standard cron syntax.
+# Format:
+#   DTSTART;TZID=<timezone>:<YYYYMMDDTHHmmss>
+#   RRULE:<rule-parts>
+# ---------------------------------------------------------------------------
+
+def rrule_once(dt: datetime, tz_name: str = "UTC") -> str:
+    """
+    Build an rrule string for a single one-time run.
+
+    Uses COUNT=1 so AAP fires the job exactly once then auto-disables
+    the schedule.
+
+    Parameters
+    ----------
+    dt      : When to run (timezone-aware datetime recommended)
+    tz_name : IANA timezone name, e.g. "Europe/London", "UTC"
+
+    Example output
+    --------------
+    DTSTART;TZID=Europe/London:20250601T070000
+    RRULE:FREQ=MINUTELY;INTERVAL=1;COUNT=1
+    """
+    local_dt = dt.astimezone(ZoneInfo(tz_name))
+    dtstart = local_dt.strftime("%Y%m%dT%H%M%S")
+    return (
+        f"DTSTART;TZID={tz_name}:{dtstart}\n"
+        "RRULE:FREQ=MINUTELY;INTERVAL=1;COUNT=1"
+    )
+
+
+def rrule_recurring(
+    dt: datetime,
+    freq: str = "DAILY",
+    interval: int = 1,
+    tz_name: str = "UTC",
+    count: Optional[int] = None,
+    until: Optional[datetime] = None,
+    byday: Optional[str] = None,
+    byhour: Optional[int] = None,
+    byminute: Optional[int] = None,
+) -> str:
+    """
+    Build an rrule string for a recurring (cron-like) schedule.
+
+    Parameters
+    ----------
+    dt        : First occurrence (timezone-aware datetime recommended)
+    freq      : MINUTELY | HOURLY | DAILY | WEEKLY | MONTHLY
+    interval  : Run every N units of freq (e.g. interval=6 + freq=HOURLY → every 6 h)
+    tz_name   : IANA timezone name
+    count     : Stop after N total runs
+    until     : Stop after this datetime (UTC)
+    byday     : Comma-separated days, e.g. "MO,TU,WE,TH,FR"
+    byhour    : Constrain to a specific hour
+    byminute  : Constrain to a specific minute
+
+    Examples
+    --------
+    Every day at 02:00 UTC:
+        rrule_recurring(datetime(2025, 6, 1, 2, 0, tzinfo=timezone.utc))
+
+    Every weekday at 06:00 London:
+        rrule_recurring(
+            datetime(2025, 6, 1, 6, 0, tzinfo=timezone.utc),
+            freq="WEEKLY",
+            tz_name="Europe/London",
+            byday="MO,TU,WE,TH,FR",
+        )
+
+    Every 6 hours, limited to 20 runs:
+        rrule_recurring(
+            datetime.now(tz=timezone.utc),
+            freq="HOURLY",
+            interval=6,
+            count=20,
+        )
+    """
+    local_dt = dt.astimezone(ZoneInfo(tz_name))
+    dtstart = local_dt.strftime("%Y%m%dT%H%M%S")
+
+    parts = [f"FREQ={freq}", f"INTERVAL={interval}"]
+    if count is not None:
+        parts.append(f"COUNT={count}")
+    if until is not None:
+        parts.append(f"UNTIL={until.strftime('%Y%m%dT%H%M%SZ')}")
+    if byday:
+        parts.append(f"BYDAY={byday}")
+    if byhour is not None:
+        parts.append(f"BYHOUR={byhour}")
+    if byminute is not None:
+        parts.append(f"BYMINUTE={byminute}")
+
+    return f"DTSTART;TZID={tz_name}:{dtstart}\nRRULE:{';'.join(parts)}"
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AAPConfig:
+    base_url: str
+    username: str
+    password: str
+    verify_ssl: bool = True
+    timeout: int = 30
+
+    @classmethod
+    def from_env(cls) -> "AAPConfig":
+        url      = os.environ.get("AAP_URL", "").rstrip("/")
+        username = os.environ.get("AAP_USERNAME", "")
+        password = os.environ.get("AAP_PASSWORD", "")
+
+        missing = [
+            name for name, val in [
+                ("AAP_URL", url),
+                ("AAP_USERNAME", username),
+                ("AAP_PASSWORD", password),
+            ] if not val
+        ]
+        if missing:
+            raise EnvironmentError(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
+
+        return cls(
+            base_url=url,
+            username=username,
+            password=password,
+            verify_ssl=os.environ.get("AAP_VERIFY_SSL", "true").lower() != "false",
+            timeout=int(os.environ.get("AAP_TIMEOUT", "30")),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Schedule payload
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchedulePayload:
+    """
+    Represents a schedule to attach to a Job Template.
+
+    Attributes
+    ----------
+    name        : Unique display name for the schedule
+    rrule       : iCalendar RRULE — use rrule_once() or rrule_recurring()
+    description : Optional human-readable description
+    enabled     : Whether the schedule is active when created
+    extra_data  : Extra variables passed to the playbook (overrides JT defaults)
+    limit       : Host limit pattern (e.g. "web_servers", "dev_*")
+    job_tags    : Comma-separated Ansible tags to run
+    skip_tags   : Comma-separated Ansible tags to skip
+    """
+    name: str
+    rrule: str
+    description: str = ""
+    enabled: bool = True
+    extra_data: dict = field(default_factory=dict)
+    limit: Optional[str] = None
+    job_tags: Optional[str] = None
+    skip_tags: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "rrule": self.rrule,
+            "description": self.description,
+            "enabled": self.enabled,
+        }
+        if self.extra_data:
+            payload["extra_data"] = self.extra_data
+        if self.limit:
+            payload["limit"] = self.limit
+        if self.job_tags:
+            payload["job_tags"] = self.job_tags
+        if self.skip_tags:
+            payload["skip_tags"] = self.skip_tags
+        return payload
+
+
+# ---------------------------------------------------------------------------
+# AAP Schedule Client
+# ---------------------------------------------------------------------------
+
+class AAPScheduleClient:
+    """
+    Manages AAP job-template schedules via the /api/v2/ REST interface.
+    Authenticates with Basic Auth (username + password).
+    """
+
+    def __init__(self, config: AAPConfig) -> None:
+        self.config = config
+        self.session = self._build_session()
+
+    def _build_session(self) -> requests.Session:
+        s = requests.Session()
+        s.auth = HTTPBasicAuth(self.config.username, self.config.password)
+        s.headers.update({"Content-Type": "application/json"})
+        s.verify = self.config.verify_ssl
+        log.info(
+            "AAP session configured — %s (user: %s, ssl_verify: %s)",
+            self.config.base_url, self.config.username, self.config.verify_ssl,
+        )
+        return s
+
+    # ── Internal HTTP helpers ───────────────────────────────────────────────
+
+    def _url(self, path: str) -> str:
+        return f"{self.config.base_url}/api/v2/{path.lstrip('/')}"
+
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        r = self.session.get(self._url(path), params=params, timeout=self.config.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, path: str, payload: dict) -> dict:
+        r = self.session.post(self._url(path), json=payload, timeout=self.config.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def _patch(self, path: str, payload: dict) -> dict:
+        r = self.session.patch(self._url(path), json=payload, timeout=self.config.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def _delete(self, path: str) -> None:
+        r = self.session.delete(self._url(path), timeout=self.config.timeout)
+        r.raise_for_status()
+
+    # ── Job template lookup ─────────────────────────────────────────────────
+
+    def resolve_job_template(self, name_or_id: str | int) -> dict:
+        """
+        Resolve a job template by name or numeric ID.
+
+        Returns the full JT dict (includes id, name, description, etc.).
+        Raises ValueError if not found or if name matches multiple templates.
+        """
+        if str(name_or_id).isdigit():
+            return self._get(f"job_templates/{name_or_id}/")
+
+        data = self._get("job_templates/", params={"name": name_or_id})
+        results = data.get("results", [])
+
+        if not results:
+            raise ValueError(f"No job template found with name: {name_or_id!r}")
+        if len(results) > 1:
+            ids = [r["id"] for r in results]
+            raise ValueError(
+                f"Multiple job templates match {name_or_id!r}. "
+                f"Use a numeric ID instead. Found IDs: {ids}"
+            )
+        return results[0]
+
+    # ── CREATE ──────────────────────────────────────────────────────────────
+
+    def create_schedule(self, jt_id: int, schedule: SchedulePayload) -> dict:
+        """
+        Create a new schedule on a job template.
+
+        Parameters
+        ----------
+        jt_id    : Numeric job template ID
+        schedule : Populated SchedulePayload
+
+        Returns
+        -------
+        dict  The created schedule (contains id, next_run, rrule, etc.)
+        """
+        log.info("Creating schedule %r on job_template id=%s", schedule.name, jt_id)
+        result = self._post(f"job_templates/{jt_id}/schedules/", schedule.to_dict())
+        log.info(
+            "Schedule created — id=%s  name=%r  next_run=%s",
+            result["id"], result["name"], result.get("next_run", "N/A"),
+        )
+        return result
+
+    # ── LIST ────────────────────────────────────────────────────────────────
+
+    def list_schedules(self, jt_id: int) -> list[dict]:
+        """
+        Return all schedules attached to a job template.
+
+        Parameters
+        ----------
+        jt_id : Numeric job template ID
+
+        Returns
+        -------
+        list[dict]  Each item is a schedule dict from the AAP API.
+        """
+        data = self._get(f"job_templates/{jt_id}/schedules/")
+        schedules = data.get("results", [])
+        log.info("Found %d schedule(s) on job_template id=%s", len(schedules), jt_id)
+        return schedules
+
+    def print_schedules(self, schedules: list[dict]) -> None:
+        """Pretty-print a schedule list to stdout."""
+        if not schedules:
+            print("  (no schedules found)")
+            return
+        header = f"  {'ID':<6} {'ENABLED':<8} {'NAME':<38} {'NEXT RUN'}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for s in schedules:
+            status = "yes" if s["enabled"] else "no"
+            next_run = s.get("next_run") or "N/A"
+            print(f"  {s['id']:<6} {status:<8} {s['name']:<38} {next_run}")
+
+    # ── ENABLE / DISABLE ────────────────────────────────────────────────────
+
+    def enable_schedule(self, schedule_id: int) -> dict:
+        """
+        Enable a schedule so it resumes firing.
+
+        Parameters
+        ----------
+        schedule_id : Numeric schedule ID (from list_schedules)
+
+        Returns the updated schedule dict.
+        """
+        log.info("Enabling schedule id=%s", schedule_id)
+        result = self._patch(f"schedules/{schedule_id}/", {"enabled": True})
+        log.info(
+            "Schedule id=%s enabled  next_run=%s",
+            schedule_id, result.get("next_run", "N/A"),
+        )
+        return result
+
+    def disable_schedule(self, schedule_id: int) -> dict:
+        """
+        Disable (pause) a schedule without deleting it.
+        Use this instead of delete when you want to resume later.
+
+        Parameters
+        ----------
+        schedule_id : Numeric schedule ID
+
+        Returns the updated schedule dict.
+        """
+        log.info("Disabling schedule id=%s", schedule_id)
+        result = self._patch(f"schedules/{schedule_id}/", {"enabled": False})
+        log.info("Schedule id=%s disabled", schedule_id)
+        return result
+
+    # ── DELETE ──────────────────────────────────────────────────────────────
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        """
+        Permanently delete a schedule by numeric ID.
+        This is irreversible — prefer disable_schedule() if you may need it again.
+
+        Parameters
+        ----------
+        schedule_id : Numeric schedule ID
+        """
+        log.warning("Deleting schedule id=%s (permanent — cannot be undone)", schedule_id)
+        self._delete(f"schedules/{schedule_id}/")
+        log.info("Schedule id=%s deleted", schedule_id)
+
+    def delete_schedule_by_name(self, jt_id: int, name: str) -> None:
+        """
+        Delete a schedule by name from a given job template.
+
+        Parameters
+        ----------
+        jt_id : Numeric job template ID
+        name  : Exact schedule name to delete
+
+        Raises ValueError if no matching schedule is found.
+        """
+        schedules = self.list_schedules(jt_id)
+        matches = [s for s in schedules if s["name"] == name]
+        if not matches:
+            raise ValueError(f"Schedule {name!r} not found on job_template id={jt_id}")
+        self.delete_schedule(matches[0]["id"])
+
+    # ── UPDATE ──────────────────────────────────────────────────────────────
+
+    def update_schedule(
+        self,
+        schedule_id: int,
+        name: Optional[str] = None,
+        rrule: Optional[str] = None,
+        description: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        extra_data: Optional[dict] = None,
+        limit: Optional[str] = None,
+        job_tags: Optional[str] = None,
+        skip_tags: Optional[str] = None,
+    ) -> dict:
+        """
+        Partially update an existing schedule (PATCH).
+        Only fields explicitly passed (not None) are sent to the API.
+
+        Parameters
+        ----------
+        schedule_id : Numeric schedule ID (from list_schedules or create_schedule)
+        name        : New display name
+        rrule       : New iCalendar rrule string — use rrule_once() / rrule_recurring()
+        description : New description
+        enabled     : True to enable, False to disable
+        extra_data  : Replacement extra variables dict
+        limit       : New host limit pattern
+        job_tags    : New comma-separated tags to run
+        skip_tags   : New comma-separated tags to skip
+
+        Returns
+        -------
+        dict  The updated schedule as returned by the AAP API.
+
+        Example — change rrule and add an extra var:
+            client.update_schedule(
+                schedule_id=42,
+                rrule=rrule_recurring(new_dt, freq="DAILY"),
+                extra_data={"env": "uat", "debug": False},
+            )
+        """
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if rrule is not None:
+            payload["rrule"] = rrule
+        if description is not None:
+            payload["description"] = description
+        if enabled is not None:
+            payload["enabled"] = enabled
+        if extra_data is not None:
+            payload["extra_data"] = extra_data
+        if limit is not None:
+            payload["limit"] = limit
+        if job_tags is not None:
+            payload["job_tags"] = job_tags
+        if skip_tags is not None:
+            payload["skip_tags"] = skip_tags
+
+        if not payload:
+            raise ValueError("update_schedule called with no fields to update")
+
+        log.info("Updating schedule id=%s — fields: %s", schedule_id, list(payload))
+        result = self._patch(f"schedules/{schedule_id}/", payload)
+        log.info(
+            "Schedule id=%s updated  next_run=%s",
+            schedule_id, result.get("next_run", "N/A"),
+        )
+        return result
+
+    # ── Idempotent upsert ───────────────────────────────────────────────────
+
+    def upsert_schedule(self, jt_id: int, schedule: SchedulePayload) -> dict:
+        """
+        Idempotent create-or-update by schedule name.
+          - No match   → creates the schedule
+          - Name match → updates rrule + enabled flag only
+
+        Useful in GitOps / pipeline contexts where you want to apply
+        a desired-state definition without caring if it already exists.
+        """
+        existing = [s for s in self.list_schedules(jt_id) if s["name"] == schedule.name]
+        if existing:
+            sid = existing[0]["id"]
+            log.info(
+                "Schedule %r already exists (id=%s) — updating rrule + enabled",
+                schedule.name, sid,
+            )
+            return self._patch(f"schedules/{sid}/", {
+                "rrule": schedule.rrule,
+                "enabled": schedule.enabled,
+            })
+        return self.create_schedule(jt_id, schedule)
+
+
+# ---------------------------------------------------------------------------
+# Examples — all four operations, both schedule types
+# ---------------------------------------------------------------------------
+
+def run_examples() -> None:
+    """
+    Runs through create / list / enable-disable / delete with concrete examples
+    of one-time and recurring schedules.
+    """
+    config = AAPConfig.from_env()
+    client = AAPScheduleClient(config)
+
+    JT_NAME = os.environ.get("JT_NAME", "My Playbook Template")
+
+    try:
+        jt = client.resolve_job_template(JT_NAME)
+    except (ValueError, requests.HTTPError) as exc:
+        log.error("Could not resolve job template %r: %s", JT_NAME, exc)
+        sys.exit(1)
+
+    jt_id: int = jt["id"]
+    now = datetime.now(tz=timezone.utc)
+
+    print(f"\n✔  Job template resolved — id={jt_id}  name={jt['name']!r}\n")
+
+    # ── 1. CREATE — one-time run 10 minutes from now ─────────────────────────
+    print("─" * 60)
+    print("CREATE — one-time schedule (fires once, 10 min from now)")
+    print("─" * 60)
+
+    once = SchedulePayload(
+        name="one-time-vm-build",
+        rrule=rrule_once(
+            dt=now + timedelta(minutes=10),
+            tz_name="Europe/London",
+        ),
+        description="Single VM build triggered by the self-service platform",
+        enabled=True,
+        extra_data={
+            "vm_name": "myvm-dev-01",
+            "environment": "dev",
+            "requestor": "pradeep",
+        },
+        limit="dev_hosts",
+    )
+    print(f"\nRRULE:\n{once.rrule}\n")
+    s_once = client.upsert_schedule(jt_id, once)
+    print(f"→ id={s_once['id']}  next_run={s_once.get('next_run', 'N/A')}\n")
+
+    # ── 2. CREATE — recurring: weekdays at 02:00 London ──────────────────────
+    print("─" * 60)
+    print("CREATE — recurring schedule (weekdays 02:00 Europe/London)")
+    print("─" * 60)
+
+    nightly = SchedulePayload(
+        name="nightly-compliance-check",
+        rrule=rrule_recurring(
+            dt=datetime(2025, 6, 1, 2, 0, tzinfo=timezone.utc),
+            freq="WEEKLY",
+            interval=1,
+            tz_name="Europe/London",
+            byday="MO,TU,WE,TH,FR",
+        ),
+        description="Nightly compliance audit — Mon-Fri 02:00 London",
+        enabled=True,
+        extra_data={"check_mode": True},
+        job_tags="compliance,audit",
+    )
+    print(f"\nRRULE:\n{nightly.rrule}\n")
+    s_nightly = client.upsert_schedule(jt_id, nightly)
+    print(f"→ id={s_nightly['id']}  next_run={s_nightly.get('next_run', 'N/A')}\n")
+
+    # ── 3. CREATE — recurring: every 6 hours, max 20 runs (created disabled) ──
+    print("─" * 60)
+    print("CREATE — recurring every 6 hours, 20 runs max (starts disabled)")
+    print("─" * 60)
+
+    patch_wave = SchedulePayload(
+        name="patch-wave-1-6hr",
+        rrule=rrule_recurring(
+            dt=now,
+            freq="HOURLY",
+            interval=6,
+            tz_name="UTC",
+            count=20,
+        ),
+        description="Patch wave 1 — every 6 hours, auto-stops after 20 runs",
+        enabled=False,
+        extra_data={"patch_group": "wave_1", "reboot": True},
+        skip_tags="pre_checks",
+    )
+    print(f"\nRRULE:\n{patch_wave.rrule}\n")
+    s_patch = client.upsert_schedule(jt_id, patch_wave)
+    print(f"→ id={s_patch['id']}  enabled={s_patch['enabled']}\n")
+
+    # ── 4. LIST all schedules ─────────────────────────────────────────────────
+    print("─" * 60)
+    print("LIST — all schedules on job template")
+    print("─" * 60 + "\n")
+    client.print_schedules(client.list_schedules(jt_id))
+
+    # ── 5. ENABLE the patch-wave schedule ────────────────────────────────────
+    print("\n" + "─" * 60)
+    print(f"ENABLE — schedule id={s_patch['id']} (patch-wave-1-6hr)")
+    print("─" * 60)
+    enabled = client.enable_schedule(s_patch["id"])
+    print(f"→ enabled={enabled['enabled']}  next_run={enabled.get('next_run', 'N/A')}\n")
+
+    # ── 6. DISABLE the nightly compliance schedule ────────────────────────────
+    print("─" * 60)
+    print(f"DISABLE — schedule id={s_nightly['id']} (nightly-compliance-check)")
+    print("─" * 60)
+    disabled = client.disable_schedule(s_nightly["id"])
+    print(f"→ enabled={disabled['enabled']}\n")
+
+    # ── 7. UPDATE the nightly schedule — new rrule + extra_data ──────────────
+    print("─" * 60)
+    print(f"UPDATE — schedule id={s_nightly['id']} (nightly-compliance-check)")
+    print("  Change: daily at 03:00 London, add extra var, re-enable")
+    print("─" * 60)
+    updated = client.update_schedule(
+        schedule_id=s_nightly["id"],
+        rrule=rrule_recurring(
+            dt=datetime(2025, 6, 1, 3, 0, tzinfo=timezone.utc),
+            freq="DAILY",
+            interval=1,
+            tz_name="Europe/London",
+        ),
+        description="Updated — daily at 03:00 London (was weekdays 02:00)",
+        enabled=True,
+        extra_data={"check_mode": False, "notify_slack": True},
+    )
+    print(f"→ id={updated['id']}  enabled={updated['enabled']}  next_run={updated.get('next_run', 'N/A')}\n")
+
+    # ── 9. DELETE the one-time schedule (clean up after it fires) ────────────
+    print("─" * 60)
+    print(f"DELETE — schedule id={s_once['id']} (one-time-vm-build)")
+    print("─" * 60)
+    client.delete_schedule(s_once["id"])
+    print(f"→ Schedule id={s_once['id']} permanently removed\n")
+
+    # ── Final state ───────────────────────────────────────────────────────────
+    print("─" * 60)
+    print("Final schedule list")
+    print("─" * 60 + "\n")
+    client.print_schedules(client.list_schedules(jt_id))
+    print("\n✔  Done.\n")
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Always show rrule previews — no AAP connection needed
+    now = datetime.now(tz=timezone.utc)
+    print("\n── RRULE previews (no AAP connection required) ─────────────────")
+
+    print("\nOne-time — 10 min from now, Europe/London:")
+    print(rrule_once(now + timedelta(minutes=10), tz_name="Europe/London"))
+
+    print("\nRecurring — weekdays 02:00 Europe/London:")
+    print(rrule_recurring(
+        datetime(2025, 6, 1, 2, 0, tzinfo=timezone.utc),
+        freq="WEEKLY",
+        tz_name="Europe/London",
+        byday="MO,TU,WE,TH,FR",
+    ))
+
+    print("\nRecurring — every 6 hours, 20 runs max:")
+    print(rrule_recurring(now, freq="HOURLY", interval=6, count=20))
+
+    print("\nRecurring — every Monday midnight UTC:")
+    print(rrule_recurring(now, freq="WEEKLY", byday="MO"))
+
+    print("\n────────────────────────────────────────────────────────────────")
+
+    # Run live examples if credentials are present
+    if os.environ.get("AAP_URL"):
+        run_examples()
+    else:
+        print(
+            "\nTo run live API examples, set:\n"
+            "  export AAP_URL=https://aap.example.com\n"
+            "  export AAP_USERNAME=admin\n"
+            "  export AAP_PASSWORD=secret\n"
+            "  export JT_NAME='My Playbook Template'\n"
+        )
